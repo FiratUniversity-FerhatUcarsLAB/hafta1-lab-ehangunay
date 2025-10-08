@@ -1,4 +1,217 @@
-Öğrenci No:
-AD-SOYAD:
+Öğrenci No:250541013
+AD-SOYAD:Emirhan GÜNAY
 
 Lütfen seçtiğiniz algoritmaya ait çözümü ve diğer isterleri aşağıya ekleyiniz:
+ALGORİTMA Sınav_Calisma_Plani_Olustur
+GİRDİLER:
+exam_date                // YYYY-MM-DD
+today                    // başlangıç tarihi
+subjects = [             // her subject: {name, topics[]}
+{ name, topics: [
+{ title, est_hours, importance (0-1), mastery (0-100), deadline? }
+], preferred_method, target_score }
+]
+availability_by_day      // map: date -> available_hours
+prefs = {
+session_length_hours, break_length_minutes,
+max_daily_hours, review_base_interval_days,
+mock_freq_days, fatigue_threshold (0-100)
+}
+
+```
+ÇIKTI:
+    calendar = map date -> list of sessions
+    alerts = list of warnings / suggestions
+
+// ---------- Yardımcı Fonksiyonlar ----------
+FONKSİYON DaysBetween(a, b) RETURN integer
+FONKSİYON SumAvailableHours(start, end) RETURN float
+FONKSİYON TotalRequiredHours(subjects) RETURN float:
+    total = 0
+    DÖNGÜ her subject IN subjects:
+        DÖNGÜ her topic IN subject.topics:
+            total += topic.est_hours * (1 + (1 - topic.mastery/100) * 0.5) // mastery etkisi
+    RETURN total
+
+FONKSİYON PrioritizeTopics(subjects) RETURN list of topics_sorted:
+    list = []
+    DÖNGÜ her subject IN subjects:
+        DÖNGÜ her topic IN subject.topics:
+            priority = topic.importance * (1 + (1 - topic.mastery/100)) 
+                       + (topic.deadline ? 1/(DaysBetween(today, topic.deadline)+1) : 0)
+            ekle list <- (subject.name, topic, priority)
+    SIRALA list by priority DESC
+    RETURN list
+
+FONKSİYON ComputeSpacedIntervals(topic, mastery) RETURN list of days_offsets:
+    // basit model: zayıfsa sık, güçlüyse seyrek
+    base = prefs.review_base_interval_days
+    IF mastery < 40 THEN multipliers = [1, 3, 7, 15]
+    ELSE IF mastery < 70 THEN multipliers = [2, 6, 14]
+    ELSE multipliers = [7, 21]
+    offsets = [ base * m FOR m IN multipliers ]
+    RETURN offsets
+
+FONKSİYON AllocateSession(date, subject_name, topic_title, hours):
+    session = {date, subject_name, topic_title, hours}
+    calendar[date].append(session)
+
+FONKSİYON FindEarliestSlot(hours_needed, start_date, end_date) RETURN date OR NULL:
+    FOR d FROM start_date TO end_date:
+        IF availability_by_day[d] - SumHours(calendar[d]) >= hours_needed THEN RETURN d
+    RETURN NULL
+
+FONKSİYON SumHours(sessions) RETURN float:
+    total = 0
+    DÖNGÜ s IN sessions: total += s.hours
+    RETURN total
+
+FONKSİYON ScheduleMockTests(start_date, end_date):
+    date = start_date
+    WHILE date <= end_date:
+        IF DaysBetween(today, date) % prefs.mock_freq_days == 0 THEN
+            AllocateSession(date, "MockTest", "Full/Partial Test", prefs.session_length_hours * 2)
+        date = date + 1
+
+FONKSİYON EvaluateProgress(recent_results, subjects):
+    // recent_results: map subject -> score
+    DÖNGÜ subject IN subjects:
+        score = recent_results.get(subject.name, subject.target_score)
+        IF score < subject.target_score:
+            // artir
+            subject.lessons_to_increase = TRUE
+            subject.priority_multiplier = 1.2
+        ELSE
+            subject.priority_multiplier = 0.9
+
+// ---------- Ana Akış ----------
+BAŞLA
+days_until_exam = DaysBetween(today, exam_date)
+IF days_until_exam <= 0:
+    yazdır("Sınav tarihi geçmiş veya bugün — acil planlama yapılıyor.")
+total_required_hours = TotalRequiredHours(subjects)
+total_available_hours = SumAvailableHours(today, exam_date)
+
+// Uygulanabilirlik kontrolü
+IF total_required_hours > total_available_hours THEN
+    alerts.append("Toplam gereken süre mevcut süreden fazla.")
+    // sıkıştırma stratejisi: düşük önemlileri kırp, seansları uzat, ek çalışma öner
+    öneri = "Önceliklendirme uygula: en yüksek importance ve düşük mastery olan konulara odaklan."
+    alerts.append(öneri)
+    // otomatik önceliklendirme: sadece en yüksek %X konuları al
+    reduction_factor = total_required_hours / total_available_hours
+    // bunu kullanırken dikkatli: aşağıda önceliklendirme ile uyumlu olacak
+
+// Temel plan oluşturma: önceliklendirilmiş topic listesi al
+topic_queue = PrioritizeTopics(subjects) // sıralı liste
+
+// İlk pass: her konu için gerekli toplam saatleri takvime dağıt
+DÖNGÜ her entry IN topic_queue:
+    subject_name = entry.subject_name
+    topic = entry.topic
+    hours_left = topic.est_hours * (1 + (1 - topic.mastery/100) * 0.5)
+    // eğer toplam süre kısıtlıysa düşük önemi kırp
+    IF total_required_hours > total_available_hours AND topic.importance < 0.4 THEN
+        hours_left = hours_left * 0.6  // kırpma
+    // Bölümlere ayır: seanslar = ceil(hours_left / prefs.session_length_hours)
+    sessions_needed = CEIL(hours_left / prefs.session_length_hours)
+    WHILE sessions_needed > 0:
+        slot = FindEarliestSlot(prefs.session_length_hours, today, exam_date)
+        IF slot == NULL:
+            alerts.append("Yeterli boş slot bulunamadı; kalan: " + hours_left + " saat için yeniden planlama gerekli.")
+            BREAK
+        AllocateSession(slot, subject_name, topic.title, prefs.session_length_hours)
+        hours_left -= prefs.session_length_hours
+        sessions_needed -= 1
+
+    // Spaced repetition: ek tekrar seansları planla
+    intervals = ComputeSpacedIntervals(topic, topic.mastery)
+    FOR offset IN intervals:
+        review_date = today + offset
+        IF review_date <= exam_date:
+            // küçük kısa tekrar seansı
+            slot = FindEarliestSlot(0.5, review_date, review_date)
+            IF slot != NULL:
+                AllocateSession(slot, subject_name, topic.title + " (Tekrar)", 0.5)
+
+// Mock testleri yerleştir
+ScheduleMockTests(today, exam_date)
+
+// Günlük rafine etme: her tarih için seansları dengeli dağıt
+FOR d FROM today TO exam_date:
+    // eğer availability_by_day[d] yoksa atla
+    IF availability_by_day.get(d, 0) == 0 THEN CONTINUE
+    // eğer gün içindeki seans toplamı > max_daily_hours -> aşımı düzelt
+    WHILE SumHours(calendar[d]) > prefs.max_daily_hours:
+        // en düşük öncelikli session'ı bul ve ileri tarihe taşı
+        lowest = FindLowestPrioritySession(calendar[d])
+        new_slot = FindEarliestSlot(lowest.hours, d+1, exam_date)
+        IF new_slot == NULL:
+            alerts.append("Taşınamaz seans bulundu: " + lowest.topic_title + " - gün " + d)
+            BREAK
+        // taşır
+        calendar[d].remove(lowest)
+        AllocateSession(new_slot, lowest.subject_name, lowest.topic_title, lowest.hours)
+
+    // yorgunluk kontrolü (basit)
+    estimated_fatigue = EstimateFatigueForDay(d)
+    IF estimated_fatigue > prefs.fatigue_threshold:
+        // azalt biraz: kısalt bir seansı
+        ShortenOneSession(d, reduce_by=0.5)
+        alerts.append("Yorgunluk yüksek: " + d + " için seans hafifletildi.")
+
+// Haftalık değerlendirme + adaptasyon döngüsü
+current_date = today
+WHILE current_date <= exam_date:
+    IF DaysBetween(today, current_date) % 7 == 0 AND current_date != today:
+        // haftalık mock test sonucu veya geribildirim beklenir
+        recent_results = GetRecentResults(current_date - 7, current_date) // dış kaynak / kullanıcı girişi
+        IF recent_results != NULL:
+            EvaluateProgress(recent_results, subjects)
+            // zayıf konuları hemen ek slotlara ata
+            DÖNGÜ subject IN subjects:
+                IF subject.priority_multiplier > 1:
+                    weak_topics = FILTER subject.topics BY mastery < 70
+                    DÖNGÜ t IN weak_topics:
+                        slot = FindEarliestSlot(1, current_date+1, current_date+7)
+                        IF slot != NULL:
+                            AllocateSession(slot, subject.name, t.title + " (Onarım)", 1)
+
+    current_date = current_date + 1
+
+// Final hafta stratejisi
+IF DaysBetween(today, exam_date) <= 7:
+    // ağırlıkla deneme + hata analizi
+    DÖNGÜ d FROM today TO exam_date:
+        // 60-80% zamanı mock test + yanlış inceleme olarak ayır
+        available = availability_by_day.get(d, 0)
+        test_hours = available * 0.7
+        AllocateSession(d, "MockTest", "Full/Partial Test", test_hours)
+        // kalan zamanda hata inceleme
+        remaining = available - test_hours
+        IF remaining > 0:
+            AllocateSession(d, "Revision", "Hata İncelemesi & Özet", remaining)
+
+// Kaçırılan seanslarla başa çıkma: günlük olarak kontrol
+DÖNGÜ d FROM today TO exam_date:
+    missed = GetMissedSessions(d) // kullanıcı girdisi / otomatik kontrol
+    IF missed.length > 0:
+        DÖNGÜ s IN missed:
+            target = FindEarliestSlot(s.hours, d+1, exam_date)
+            IF target != NULL:
+                AllocateSession(target, s.subject_name, s.topic_title + " (Telafi)", s.hours)
+            ELSE
+                alerts.append("Telafi yeri bulunamadı: " + s.topic_title + ". Önceliklendirme gerek.")
+
+// Son tutarlılık kontrolleri
+//  - Her gün toplam saat availability_by_day'i aşmamalı
+//  - Gerekiyorsa düşük önemli konular daha da kırpılabilir
+DÖNGÜ d FROM today TO exam_date:
+    IF SumHours(calendar[d]) > availability_by_day.get(d,0):
+        alerts.append("Planlama çakışması: " + d)
+
+YAZDIR("Plan oluşturuldu. Alerts sayısı: " + LENGTH(alerts))
+RETURN {calendar, alerts}
+```
+
+BİTİR

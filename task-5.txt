@@ -1,4 +1,224 @@
-Öğrenci No:
-AD-SOYAD:
+Öğrenci No:250541013
+AD-SOYAD:Emirhan GÜNAY 
 
-Lütfen seçtiğiniz algoritmaya ait çözümü ve diğer isterleri aşağıya ekleyiniz:
+Lütfen seçtiğiniz algoritmaya ait çözümü ve diğer isterleri aşağıya ekleyiniz.
+ALGORITMA Reklam_Oneri_Sistemi
+
+// ---------- Yardımcı Fonksiyonlar ----------
+FONKSİYON NormalizeText(t) RETURN t_norm:
+    t ← trim(t)
+    t ← lowercase_locale_aware(t) // TR için özel kurallar
+    t ← remove_punctuation(t)
+    RETURN t
+
+FONKSİYON ExtractSignals(events) RETURN signals:
+    // events: list of {type, content, timestamp, duration}
+    signals = {}
+    FOR ev IN events:
+        IF ev.type == "like" THEN signals.likes.append(ev)
+        IF ev.type == "search" THEN signals.searches.append(ev)
+        IF ev.type == "view" THEN signals.views.append(ev)
+        IF ev.type == "comment" THEN signals.comments.append(ev)
+    RETURN signals
+
+FONKSİYON TimeWeight(age_days) RETURN w:
+    // exponential decay: newer events daha yüksek ağırlık
+    lambda = ln(2) / DECAY_HALF_LIFE
+    w = exp(-lambda * age_days)
+    RETURN w
+
+FONKSİYON MapToCategories(text) RETURN category_scores:
+    // basit: keyword match veya embedding -> softmax sınıflama
+    tokens = Tokenize(NormalizeText(text))
+    category_scores = ClassifierPredict(tokens) // returns map category->score
+    RETURN category_scores
+
+FONKSİYON BuildUserProfile(user_id, now) RETURN profile:
+    events = GetEvents(user_id, since = now - WINDOW_LONG)
+    signals = ExtractSignals(events)
+    profile = initialize zero vector for categories
+    // kısa dönem öne çıkar
+    FOR ev IN signals.likes + signals.views + signals.searches:
+        age_days = (now - ev.timestamp).days
+        w = TimeWeight(age_days)
+        cats = MapToCategories(ev.content)
+        // ağırlık: like>view>search>comment
+        type_mult = GetTypeMultiplier(ev.type)  // like:1.5 view:1.0 search:1.2...
+        FOR c,score IN cats:
+            profile[c] += score * w * type_mult
+    // normalize profile (l1)
+    profile = profile / sum(profile) IF sum>0 ELSE uniform
+    RETURN profile
+
+FONKSİYON CandidateGeneration(profile, context) RETURN candidates:
+    // 1) Content-based: match ad categories to profile top-k
+    top_cats = TopK(profile, k=5)
+    candidates_cb = QueryAdsByCategories(top_cats)
+
+    // 2) Collaborative: similar users -> ads they converted
+    neighbors = FindSimilarUsers(profile, limit=100)
+    candidates_cf = AggregateAdsFromNeighbors(neighbors)
+
+    // 3) Contextual fallback: page/topic/time-based
+    candidates_context = QueryContextualAds(context)
+
+    // merge and dedupe
+    candidates = MergeUnique(candidates_cb, candidates_cf, candidates_context)
+    RETURN candidates
+
+FONKSİYON ApplyBusinessFilters(candidates, user, context) RETURN filtered:
+    filtered = []
+    FOR ad IN candidates:
+        IF NOT AgeAllowed(ad, user.age) THEN CONTINUE
+        IF NOT GeoAllowed(ad, user.geo) THEN CONTINUE
+        IF AdBudgetExhausted(ad) THEN CONTINUE
+        IF UserOptOut(user, ad.category) THEN CONTINUE
+        filtered.append(ad)
+    RETURN filtered
+
+FONKSİYON ComputeFeatures(user_profile, ad, context, history) RETURN feat_vector:
+    feat = {}
+    feat['relevance'] = Dot(user_profile, ad.category_vector)  // content match
+    feat['recency_match'] = RecencyMatch(user_profile, ad) // e.g., if searched recently
+    feat['ad_quality'] = ad.quality_score
+    feat['historical_ctr'] = GetGlobalCTR(ad) // smoothed
+    feat['user_ad_freq'] = CountAdImpressions(user, ad, period=24h)
+    feat['time_of_day'] = context.hour_feature
+    feat['device'] = context.device_type
+    feat['similar_user_ctr'] = EstimateFromNeighbors(ad, neighbors)
+    RETURN feat
+
+FONKSİYON PredictCTR(feat_vector) RETURN p_ctr:
+    // placeholder: ML model (logistic/regression/GBM/NN)
+    p_ctr = MLModelPredict(feat_vector)
+    // safety: clamp probability
+    p_ctr = clamp(p_ctr, 0.0001, 0.9999)
+    RETURN p_ctr
+
+FONKSİYON ScoreAd(p_ctr, ad, feat_vector) RETURN score:
+    // örnek skor bileşenleri
+    bid = ad.bid_per_click
+    relevance = feat_vector['relevance']
+    quality = feat_vector['ad_quality']
+    fatigue_penalty = sigmoid(feat_vector['user_ad_freq'] - FREQ_CAP) // artan ceza
+    diversity_bonus = ComputeDiversityBonus(ad, previously_shown)
+    // combined score (tune weights)
+    score = (alpha1 * p_ctr * bid) + (alpha2 * relevance) + (alpha3 * quality) + (alpha4 * diversity_bonus) - (alpha5 * fatigue_penalty)
+    RETURN score
+
+FONKSİYON ExplorationSelection(candidates_with_scores) RETURN selected_ad:
+    // epsilon-greedy örneği
+    r = RandomUniform(0,1)
+    IF r < EPSILON:
+        // keşif: rastgele seç ama düşük etkili adları filtrele
+        return RandomChoice(TopN(candidates_with_scores, n=20, by='diversity'))
+    ELSE:
+        // exploitation: seç en yüksek score'u
+        return ArgMax(candidates_with_scores, key='score')
+
+FONKSİYON ApplyFrequencyCap(user, ad) RETURN bool:
+    impressions = CountAdImpressions(user, ad, period=24h)
+    IF impressions >= FREQ_CAP THEN RETURN FALSE
+    RETURN TRUE
+
+FONKSİYON ServeAd(user, ad, slot):
+    RenderAdToUser(ad, slot)
+    IncrementImpressionCounters(user, ad)
+    LogEvent("ad_shown", user, ad, timestamp=Now())
+
+FONKSİYON HandleFeedback(user, ad, event):
+    // event: click, view_time, conversion, skip
+    LogEvent(event.type, user, ad, event.details)
+    // online update (simple)
+    UpdatePerAdStats(ad, event)
+    UpdateUserAdHistory(user, ad, event)
+
+FONKSİYON OnlineUpdateModel(user, ad, event):
+    feat = ComputeFeatures(BuildUserProfile(user, Now()), ad, CurrentContext(), GetHistory(user))
+    label = MapEventToLabel(event) // click->1, no_click->0, conversion->higher weight
+    // incremental update to CTR model (e.g., SGD step)
+    MLModelOnlineUpdate(feat, label)
+
+// ---------- Ana Akış (her Ad Request) ----------
+BAŞLA
+
+ON AdRequest(user, context, slot):
+    now = Now()
+    // 1) profil oluştur
+    profile = BuildUserProfile(user.id, now)
+
+    // 2) aday seçimi
+    candidates = CandidateGeneration(profile, context)
+
+    // 3) iş kuralları ile filtrele
+    candidates = ApplyBusinessFilters(candidates, user, context)
+
+    // 4) hesaplama & scoring
+    scored = []
+    FOR ad IN candidates:
+        IF NOT ApplyFrequencyCap(user, ad) THEN CONTINUE
+        feat = ComputeFeatures(profile, ad, context, GetHistory(user))
+        p_ctr = PredictCTR(feat)
+        score = ScoreAd(p_ctr, ad, feat)
+        scored.append({ad: ad, score: score, p_ctr: p_ctr, feat: feat})
+
+    IF LENGTH(scored) == 0:
+        ServeFallbackAd(user, slot)
+        RETURN
+
+    // 5) exploration/exploitation karar (örn. epsilon-greedy veya UCB)
+    chosen_ad = ExplorationSelection(scored)
+
+    // 6) son güvenlik/frekans kontrol (business)
+    IF NOT ApplyFrequencyCap(user, chosen_ad) OR NOT AdAllowedByPolicy(chosen_ad, user):
+        // fallback veya second best
+        chosen_ad = NextBest(scored, exclude=[chosen_ad]) OR ServeFallbackAd
+    ENDIF
+
+    // 7) göster
+    ServeAd(user, chosen_ad, slot)
+
+    // 8) gerçek zamanlı dinle: kullanıcı etkileşimi geldikçe
+    ON FeedbackEvent(event):
+        HandleFeedback(user, chosen_ad, event)
+        OnlineUpdateModel(user, chosen_ad, event)
+
+    // 9) logging & metrics
+    LogMetricsForMonitoring(user, chosen_ad, scored, now)
+
+END ON
+
+// ---------- Periyodik / Batch işler ----------
+SCHEDULE daily at 02:00:
+    // retrain offline model with last N days of data
+    dataset = BuildTrainingSet(last_days=30)
+    RetrainCTRModel(dataset)
+    RecomputeGlobalStatistics()
+    RunA/BTestsAndUpdateExplorationParams()
+
+SCHEDULE weekly:
+    // compute diversity/fairness metrics, check for feedback loops / filter bubble
+    EvaluateDiversityMetrics()
+    If DiversityTooLow THEN AdjustAlphaWeightsForDiversity()
+
+// ---------- Cold-start handling ----------
+FONKSİYON ColdStart(user, context) RETURN profile:
+    // az veri varsa: rely on contextual signals & popular ads & demographic proxies (if allowed)
+    context_profile = BuildProfileFromContext(context)
+    demographic_profile = GetDemographicDefaults(user)
+    profile = BlendProfiles(context_profile, demographic_profile, weights=[0.7,0.3])
+    RETURN profile
+
+// ---------- Gizlilik & Etik ----------
+IF UserHasNotConsentedToPersonalization(user):
+    UseContextualAdsOnly()
+    RespectDoNotTrack()
+    ProvideClearOptOut()
+
+// ---------- İzleme & KPI'lar ----------
+MONITOR continuously:
+    CTR, CVR, RevenuePerImpression, DiversityIndex, UserSatisfactionScore
+    AlertIf(CTR_drop > threshold OR Revenue_drop)
+
+BİTİR
+

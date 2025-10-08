@@ -1,4 +1,221 @@
-Öğrenci No:
-AD-SOYAD:
+Öğrenci No:250541013
+AD-SOYAD:Emirhan GÜNAY
 
 Lütfen seçtiğiniz algoritmaya ait çözümü ve diğer isterleri aşağıya ekleyiniz:
+```
+// Basit Kart Oyunu Stratejisi — Detaylı Pseudocode
+// İçerik: durum temsili, rakip modelleme, Monte Carlo playout'lar, risk ölçüleri, karar kuralı.
+
+// ------------ Parametreler / Ayarlar ------------
+CONSTANT DEFAULT_SIMULATIONS = 500
+CONSTANT DEFAULT_DEPTH = 3                // arama derinliği / playout adedi
+CONSTANT RISK_AVERSION_BASE = 0.6         // 0 = risk-sever, 1 = çok risk-çekingen
+CONSTANT MIN_SAMPLES_FOR_MODEL = 20
+
+// ------------ Veri Yapıları ------------
+state = {
+    deck_remaining,       // açıkça bilinen destede kalan kartlar
+    table_cards,          // açık kartlar/ortadaki durum
+    hands: map player -> list of cards (sadece kendi el görünür)
+    turn_player,
+    scores: map player -> score,
+    history: list of (player, action, observed_info)
+}
+
+opponent_model[player] = {
+    action_counts: map state_features -> map action -> count,
+    aggression_index: float,       // [-1,1] negatif=pasif, pozitif=agresif
+    reliability: float             // model güvenirliği (ör: veri miktarı)
+}
+
+// ------------ Yardımcı Fonksiyonlar ------------
+FONKSİYON FeaturesFromState(state, player) RETURN features:
+    // Basit örnek: el_büyüklüğü, son_hamle_tipi, table_strength_estimate
+    features = { hand_size: LENGTH(state.hands[player]),
+                 last_opponent_action: state.history[-1].action OR None,
+                 table_pressure: EstimateTablePressure(state) }
+    RETURN features
+
+FONKSİYON GenerateLegalMoves(state, player) RETURN moves_list:
+    // Oyun kurallarına göre geçerli hamleleri üret
+    // Örn: ["oyna:Karo7", "pas", "çek"]
+    RETURN rules_engine.get_moves(state, player)
+
+FONKSİYON UpdateOpponentModelFromObservation(player, observed_action, state):
+    features = FeaturesFromState(state, player)
+    opponent_model[player].action_counts[features][observed_action] += 1
+    opponent_model[player].reliability = ComputeReliability(opponent_model[player])
+    opponent_model[player].aggression_index = RecomputeAggression(opponent_model[player])
+
+FONKSİYON PredictActionProbabilities(player, state, legal_actions) RETURN prob_map:
+    features = FeaturesFromState(state, player)
+    counts = opponent_model[player].action_counts.get(features, NULL)
+    IF counts == NULL OR Sum(counts.values()) < MIN_SAMPLES_FOR_MODEL THEN
+        // yetersiz veri: basit bayes / uniform smoothed tahmin
+        RETURN SmoothedUniformProb(legal_actions)
+    total = Sum(counts.values())
+    probs = {}
+    FOR a IN legal_actions:
+        probs[a] = (counts.get(a,0) + 1) / (total + LENGTH(legal_actions))   // Laplace smoothing
+    RETURN probs
+
+FONKSİYON SampleHiddenCards(state) RETURN sampled_full_state:
+    // Rastgele/olası dağılım: kalan desteden/diğer oyuncuların el büyüklüğüne göre kartları örnekle
+    // Basit: uniformly shuffle deck_remaining ve dağıt
+    sampled_state = DEEP_COPY(state)
+    sampled_hands_for_others = DealRemainingCardsRandomly(sampled_state)
+    sampled_state.hands.update(sampled_hands_for_others)
+    RETURN sampled_state
+
+FONKSİYON SimulatePlayout(sim_state, depth_limit) RETURN utility_map:
+    // Simulate game to terminal or depth_limit using:
+    // - rakip hareketleri => PredictActionProbabilities (ör: sample from model)
+    // - kendi taktikleri => basit policy (kısa-derinlik minimax) veya rastgele
+    depth = 0
+    WHILE NOT IsTerminal(sim_state) AND depth < depth_limit:
+        current = sim_state.turn_player
+        legal = GenerateLegalMoves(sim_state, current)
+        IF current == MY_PLAYER_ID:
+            // oynayan modeli: basit heuristics (faster) veya rollout-policy
+            move = HeuristicPolicy(sim_state, legal)
+        ELSE:
+            probs = PredictActionProbabilities(current, sim_state, legal)
+            move = SampleFromDistribution(probs)  // stochastic opponent action
+        sim_state = ApplyMove(sim_state, move)
+        depth += 1
+    // Terminal veya depth reached: hesapla utility (ör: puan farkı)
+    utilities = ComputeUtilities(sim_state)  // map player->numeric utility
+    RETURN utilities
+
+FONKSİYON EvaluateMoveUsingMC(state, move, n_simulations, depth_limit) RETURN stats:
+    // Her simulasyonda:
+    // 1) gizli bilgileri örnekle
+    // 2) move'u uygula
+    // 3) playout yap
+    results = []   // utilities for MY_PLAYER_ID
+    losses = []
+    FOR i FROM 1 TO n_simulations:
+        sample_state = SampleHiddenCards(state)
+        new_state = ApplyMove(sample_state, move)
+        utilities = SimulatePlayout(new_state, depth_limit)
+        my_util = utilities[MY_PLAYER_ID]
+        results.append(my_util)
+    ev = MEAN(results)
+    sd = STDDEV(results)
+    worst = MIN(results)
+    // CVaR: ortalamanın altındaki %q kayıpların ortalaması
+    cvar = ComputeCVaR(results, alpha=0.1)
+    RETURN {expected_value: ev, stddev: sd, worst_case: worst, cvar: cvar, samples: results}
+
+FONKSİYON DecisionRule(candidate_stats_list, risk_aversion):
+    // candidate_stats_list: [{move, expected_value, stddev, worst_case, cvar}, ...]
+    // Alternatif karar kuralları:
+    // A) EV maksimize et
+    // B) EV - risk_aversion * stddev  (risk ağırlıklı)
+    // C) Maximize worst_case (konservatif)
+    // D) Maximize CVaR (sağlamlık)
+    FOR each candidate IN candidate_stats_list:
+        candidate.score_risk_adjusted = candidate.expected_value - (risk_aversion * candidate.stddev)
+        candidate.score_conservative = candidate.worst_case
+        candidate.score_cvar = -candidate.cvar   // daha düşük cvar (daha iyi) için negatif
+    // Kombine: ağırlıklı skor (ör: 0.6 EV_risk, 0.4 conservative)
+    FOR c IN candidate_stats_list:
+        c.combined_score = 0.6 * c.score_risk_adjusted + 0.4 * c.score_conservative
+    // seç en yüksek combined_score
+    best = ARG_MAX(candidate_stats_list, key = combined_score)
+    RETURN best.move
+
+// ------------ Ana Döngü (Oyuncu Sırası Benimseme) ------------
+BAŞLA OYUN_STRATEGI:
+    // Başlatma
+    INIT opponent_model for each opponent
+    params = { sims: DEFAULT_SIMULATIONS, depth: DEFAULT_DEPTH, risk_aversion: RISK_AVERSION_BASE }
+
+    WHILE NOT IsTerminal(state):
+        IF state.turn_player != MY_PLAYER_ID:
+            WAIT_FOR_OPPONENT_ACTION()
+            obs_action = GetLastActionFromHistory(state)
+            UpdateOpponentModelFromObservation(obs_action.player, obs_action.action, state)
+            CONTINUE
+
+        // 1) Gözlem / durum güncelle
+        current_state = DEEP_COPY(state)
+        legal_moves = GenerateLegalMoves(current_state, MY_PLAYER_ID)
+
+        // 2) Eğer erken oyunsa bilgi toplama stratejisi/çeşitli hamle öncelikleri
+        IF InEarlyGame(current_state):
+            // tercihen bilgi elde eden hamleleri (rakibin elini daha iyi tanımlayan) değerlendirmek mantıklı
+            prefer_info_gain = TRUE
+        ELSE
+            prefer_info_gain = FALSE
+
+        // 3) Her hamle için Monte Carlo değerlendirme (paralelleştirilebilir)
+        candidate_stats = []
+        FOR move IN legal_moves:
+            // hızlı filtre: eğer heuristik ile move bariz zayıfsa atla
+            IF HeuristicReject(move, current_state) THEN CONTINUE
+            stats = EvaluateMoveUsingMC(current_state, move, params.sims, params.depth)
+            // opsiyonel olarak bilgi-kazancı (information gain) hesapla
+            stats.info_gain = EstimateInformationGain(current_state, move)
+            // bilgi-odaklı scoring: EV + lambda * info_gain
+            stats.adjusted_ev = stats.expected_value + (0.3 * stats.info_gain) IF prefer_info_gain ELSE stats.expected_value
+            candidate_stats.append({move: move, **stats})
+
+        // 4) Karar: risk ve hedefe göre seç
+        chosen_move = DecisionRule(candidate_stats, params.risk_aversion)
+
+        // 5) Oyna ve durumu güncelle
+        state = ApplyMove(state, chosen_move)
+        RecordActionInHistory(MY_PLAYER_ID, chosen_move)
+
+        // 6) Gözlemlerle öğren
+        // - Rakibin cevabı geldikçe opponent_model güncellenecek
+        // - Eğer model tutarlılığı düşükse (reliability düşük) daha fazla simülasyon yap veya risk_aversion artır
+        IF AnyOpponentModelLowReliability():
+            params.sims = params.sims * 1.2           // daha fazla örnekleme
+            params.risk_aversion = MIN(1.0, params.risk_aversion + 0.05)
+
+    // Oyun bitti
+    final_util = ComputeUtilities(state)
+    YAZDIR("Oyun bitti, sonuç: ", final_util)
+
+// ------------ Risk Değerlendirme Fonksiyonları ------------
+FONKSİYON ComputeCVaR(results, alpha):
+    SORT results ASC
+    k = CEIL(alpha * LENGTH(results))
+    tail = results[0:k]
+    RETURN MEAN(tail)
+
+FONKSİYON EstimateInformationGain(state, move) RETURN float:
+    // Basit yaklaşım: hareket sonrası mümkün olan farklı gizli dağılımların entropi farkı
+    // Yaklaşık olarak: simülasyonlarda rakip el tahminlerinin çeşitliliği azalıyor mu?
+    // Kısa: rastgele birkaç sample ile ön/son entropi farkı hesapla
+    RETURN approx_info_gain
+
+// ------------ Rakip Tiplerine Göre Adaptasyon ------------
+FONKSİYON ClassifyOpponent(player) RETURN type:
+    // Gelen action history'e göre: Aggressive, Conservative, Random, Adaptive
+    score = opponent_model[player].aggression_index
+    IF score > 0.4 THEN RETURN "Aggressive"
+    ELSE IF score < -0.4 THEN RETURN "Conservative"
+    ELSE RETURN "Neutral"
+
+FONKSİYON AdaptStrategyBasedOnOpponentTypes():
+    types = [ClassifyOpponent(p) FOR p IN opponents]
+    IF any type == "Aggressive":
+        // daha konservatif oyna: risk_aversion++ ve daha fazla düşman bluff'ı düşün
+        params.risk_aversion = MIN(1.0, params.risk_aversion + 0.15)
+    IF all types == "Conservative":
+        // fırsatları değerlendir: risk_aversion--
+        params.risk_aversion = MAX(0.0, params.risk_aversion - 0.1)
+
+// ------------ Performans / İyileştirme Notları ------------
+/*
+- Simülasyon sayısı ile karar kalitesi artar; fakat hesap maliyeti büyür.
+- Gerçek zaman kısıtı varsa: düşük sims + derinlik, ancak iyi heuristics (rule-based policy) şart.
+- Daha sofistike: MCTS (Monte Carlo Tree Search) kullan; rollout policy olarak opponent model.
+- Uzun vadede: self-play / reinforcement learning ile policy öğren (ancak bu ekstra altyapı ister).
+- Risk yönetimi: EV yanında stddev, worst_case, ve CVaR kullanılarak güvenli seçimler yapılır.
+*/
+
+```

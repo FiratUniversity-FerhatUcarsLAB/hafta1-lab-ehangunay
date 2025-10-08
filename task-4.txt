@@ -1,4 +1,225 @@
-Öğrenci No:
-AD-SOYAD:
+Öğrenci No:250541013
+AD-SOYAD:Emirhan GÜNAY
 
 Lütfen seçtiğiniz algoritmaya ait çözümü ve diğer isterleri aşağıya ekleyiniz:
+ALGORİTMA HedefRengiEldeEt(bases_list, target_color, params)
+
+    GİRDİLER:
+        bases_list = [B1, B2, ..., Bn]   // her Bi: {id, color} color = RGB veya LAB vektörü
+        target_color                      // aynı uzayda
+        params = { ERROR_THRESHOLD, MAX_ITER, STEP_INIT, MIN_STEP, COLOR_SPACE }
+
+    ÇIKTI:
+        best_recipe = { base_id -> ratio }   // her tabana atanmış oran (toplam 1)
+        best_color = color result
+        best_error = ColorDistance(best_color, target_color)
+
+    // ---------- Yardımcı Fonksiyonlar ----------
+    FONKSİYON ToWorkingSpace(color, COLOR_SPACE) RETURN vec:
+        IF COLOR_SPACE == "LAB" THEN
+            RETURN ConvertRGBtoLAB(color) // ya da zaten LAB ise identity
+        ELSE
+            RETURN NormalizeRGB(color)   // [0,1] arası
+
+    FONKSİYON ColorDistance(c1, c2) RETURN float:
+        // tercihen LAB uzayında Euclidean (ΔE aproks.)
+        RETURN EuclideanDistance(c1, c2)
+
+    FONKSİYON MixLinear(bases, ratios) RETURN color:
+        // ratios normalized so sum(ratios)=1
+        mix = ZeroVector()
+        FOR i FROM 1 TO LENGTH(bases):
+            mix += ratios[i] * bases[i].color
+        // clamp/normalize if needed:
+        RETURN ClampColor(mix)
+
+    FONKSİYON NormalizeRatios(ratios) RETURN ratios:
+        s = SUM(ratios)
+        IF s == 0 THEN RETURN UniformRatios()
+        FOR i: ratios[i] = ratios[i] / s
+        RETURN ratios
+
+    FONKSİYON BestPairProjection(b1, b2, target) RETURN alpha:
+        // closed-form alpha minimizing ||alpha*b1 + (1-alpha)*b2 - target|| in linear space
+        v = b1.color - b2.color
+        denom = Dot(v, v)
+        IF denom == 0 THEN RETURN 0.5
+        alpha = Dot(target - b2.color, v) / denom
+        alpha = Clamp(alpha, 0, 1)
+        RETURN alpha
+
+    FONKSİYON NonNegLeastSquares(bases_subset, target) RETURN ratios:
+        // basit NNLS (iteratif projected gradient) veya küçük QP solve
+        // Initialize ratios >=0, sum to 1: start uniform
+        ratios = Uniform(len(bases_subset))
+        ITER = 0
+        WHILE ITER < 200:
+            mix = MixLinear(bases_subset, ratios)
+            grad = ComputeGradientApprox(bases_subset, mix, target) // approx
+            // gradient step
+            ratios = ratios - 0.1 * grad
+            // project to non-neg and normalize
+            FOR i: ratios[i] = MAX(ratios[i], 0)
+            ratios = NormalizeRatios(ratios)
+            IF Converged(ratios) THEN BREAK
+            ITER += 1
+        RETURN ratios
+
+    // ---------- Divide & Conquer Representative ----------
+    FONKSİYON DnC_Representative(bases_subset, target, depth_limit) RETURN (rep_color, recipe):
+        n = LENGTH(bases_subset)
+        IF n == 1:
+            return (bases_subset[0].color, {bases_subset[0].id: 1.0})
+        IF n == 2:
+            alpha = BestPairProjection(bases_subset[0], bases_subset[1], target)
+            mix = alpha * bases_subset[0].color + (1-alpha) * bases_subset[1].color
+            recipe = { bases_subset[0].id: alpha, bases_subset[1].id: 1-alpha }
+            RETURN (mix, recipe)
+        IF depth_limit == 0 OR n <= 4:
+            // small set: solve NNLS directly
+            ratios = NonNegLeastSquares(bases_subset, target)
+            mix = MixLinear(bases_subset, ratios)
+            recipe = MapIDsToRatios(bases_subset, ratios)
+            RETURN (mix, recipe)
+
+        // split into two halves (divide)
+        mid = n // 2
+        left = bases_subset[0:mid]
+        right = bases_subset[mid:n]
+
+        // conquer: obtain representative for each half (they try to approximate the global target)
+        (repL_color, repL_recipe) = DnC_Representative(left, target, depth_limit - 1)
+        (repR_color, repR_recipe) = DnC_Representative(right, target, depth_limit - 1)
+
+        // combine two representatives by projecting target onto line repL - repR
+        // treat repL and repR as "super-bases"
+        v = repL_color - repR_color
+        denom = Dot(v, v)
+        IF denom == 0 THEN alpha = 0.5 ELSE alpha = Clamp(Dot(target - repR_color, v)/denom, 0, 1)
+        combined_color = alpha * repL_color + (1-alpha) * repR_color
+
+        // build combined recipe: scale underlying recipes by alpha and (1-alpha)
+        combined_recipe = {}
+        FOR (id, r) IN repL_recipe: combined_recipe[id] = alpha * r
+        FOR (id, r) IN repR_recipe: combined_recipe[id] = combined_recipe.get(id,0) + (1-alpha) * r
+
+        // normalize to counter numeric drift
+        total = SUM(values(combined_recipe))
+        FOR id IN combined_recipe: combined_recipe[id] /= total
+
+        RETURN (combined_color, combined_recipe)
+
+    // ---------- Global Greedy + DnC + Local Refinement Flow ----------
+    BAŞLA
+    // convert all to working color space
+    FOR b IN bases_list:
+        b.color = ToWorkingSpace(b.color, params.COLOR_SPACE)
+    target = ToWorkingSpace(target_color, params.COLOR_SPACE)
+
+    // 1) Baseline: best single base
+    best_error = +INF
+    best_recipe = NULL
+    FOR b IN bases_list:
+        err = ColorDistance(b.color, target)
+        IF err < best_error:
+            best_error = err
+            best_recipe = { b.id: 1.0 }
+            best_color = b.color
+
+    IF best_error <= params.ERROR_THRESHOLD:
+        RETURN (best_recipe, best_color, best_error)
+
+    // 2) Try best pair (fast closed-form)
+    // find pair whose projection gives smallest error
+    FOR i FROM 1 TO n-1:
+        FOR j FROM i+1 TO n:
+            alpha = BestPairProjection(bases_list[i], bases_list[j], target)
+            mix = alpha * bases_list[i].color + (1-alpha) * bases_list[j].color
+            err = ColorDistance(mix, target)
+            IF err < best_error:
+                best_error = err
+                best_recipe = { bases_list[i].id: alpha, bases_list[j].id: 1-alpha }
+                best_color = mix
+
+    IF best_error <= params.ERROR_THRESHOLD:
+        RETURN (best_recipe, best_color, best_error)
+
+    // 3) Divide & Conquer representative (handles many bases efficiently)
+    depth_limit = CEIL(log2(n)) + 1
+    (rep_color, rep_recipe) = DnC_Representative(bases_list, target, depth_limit)
+    rep_error = ColorDistance(rep_color, target)
+    IF rep_error < best_error:
+        best_error = rep_error
+        best_recipe = rep_recipe
+        best_color = rep_color
+    IF best_error <= params.ERROR_THRESHOLD:
+        RETURN (best_recipe, best_color, best_error)
+
+    // 4) Local refinement (coordinate descent + stochastic tweaks)
+    // initialize with best_recipe
+    recipe = best_recipe
+    // ensure recipe covers all bases: create vector aligned with bases_list order
+    ratios = RecipeToVector(recipe, bases_list)
+    ratios = NormalizeRatios(ratios)
+
+    step = params.STEP_INIT
+    iter = 0
+    WHILE iter < params.MAX_ITER AND step >= params.MIN_STEP:
+        improved = FALSE
+
+        // Coordinate descent: for each base, try adding +step or -step (bounded) then renormalize
+        FOR k FROM 1 TO n:
+            // try increment
+            candidate = COPY(ratios)
+            candidate[k] = candidate[k] + step
+            candidate = NormalizeRatios(candidate)
+            mix = MixLinear(bases_list, candidate)
+            err = ColorDistance(mix, target)
+            IF err < best_error:
+                best_error = err
+                ratios = candidate
+                best_color = mix
+                improved = TRUE
+                IF best_error <= params.ERROR_THRESHOLD: BREAK ALL_LOOPS
+
+            // try decrement
+            candidate = COPY(ratios)
+            candidate[k] = MAX(candidate[k] - step, 0)
+            candidate = NormalizeRatios(candidate)
+            mix = MixLinear(bases_list, candidate)
+            err = ColorDistance(mix, target)
+            IF err < best_error:
+                best_error = err
+                ratios = candidate
+                best_color = mix
+                improved = TRUE
+                IF best_error <= params.ERROR_THRESHOLD: BREAK ALL_LOOPS
+
+        // stochastic small perturbations (escape local minima)
+        IF NOT improved:
+            FOR t FROM 1 TO 10:
+                candidate = COPY(ratios)
+                i = RandomIndex(1,n); j = RandomIndex(1,n) WHILE j==i
+                delta = (RandomUniform(-1,1) * step*0.5)
+                candidate[i] = MAX(candidate[i] + delta, 0)
+                candidate[j] = MAX(candidate[j] - delta, 0)
+                candidate = NormalizeRatios(candidate)
+                mix = MixLinear(bases_list, candidate)
+                err = ColorDistance(mix, target)
+                IF err < best_error:
+                    best_error = err
+                    ratios = candidate
+                    best_color = mix
+                    improved = TRUE
+                    BREAK
+
+        IF NOT improved:
+            step = step / 2   // reduce step size (simulated annealing / iterative deepening)
+        iter += 1
+
+    // finalize recipe map
+    final_recipe = MapVectorToRecipe(ratios, bases_list)
+    RETURN (final_recipe, best_color, best_error)
+
+
+BİTİR

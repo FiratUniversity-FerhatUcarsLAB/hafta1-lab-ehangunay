@@ -1,4 +1,251 @@
-Öğrenci No:
-AD-SOYAD:
+Öğrenci No:250541013
+AD-SOYAD:Emirhan GÜNAY 
 
 Lütfen seçtiğiniz algoritmaya ait çözümü ve diğer isterleri aşağıya ekleyiniz:
+// Veri model
+// Contact = { id, raw_name, first_name, last_name, company, phone_numbers[], normalized_name, normalized_phone_numbers[] }
+
+ALGORITMA TelefonRehberi_Organizasyonu
+
+    GİRDİLER:
+        contacts_raw_list  // ham liste (dosya/CSV/kullanıcı girişi)
+        prefs = {
+            sort_key: "last_first" OR "first_last" OR custom_field_list,
+            locale: "tr" OR "en" OR custom_collation,
+            small_threshold: 100,
+            prefer_stable_sort: TRUE,
+            prefix_search_enabled: TRUE,
+            frequent_updates: BOOLEAN,
+            fuzzy_enabled: TRUE
+        }
+
+    ÇIKTI:
+        contacts_sorted_list
+        indices = {hash_map_by_phone, trie_by_name (optional), sorted_array_index}
+
+    // ---------- Yardımcı Fonksiyonlar ----------
+    FONKSİYON NormalizeString(s, locale) RETURN normalized_s:
+        // - Trim, collapse spaces
+        s ← Trim(s)
+        s ← ReplaceMultipleSpacesWithSingle(s)
+        // - Unicode normalize (NFC) ve case folding according to locale
+        s ← UnicodeNormalizeNFC(s)
+        IF locale == "tr" THEN
+            // Türkçe özgü case-folding: İ↔i, I↔ı
+            s ← TurkishCaseFold(s)
+        ELSE
+            s ← ToLowerCase(s)
+        // - (Opsiyonel) diakritikleri kaldır
+        s ← RemoveDiacriticsIfNeeded(s)
+        RETURN s
+
+    FONKSİYON NormalizePhoneNumber(phone_raw) RETURN digits_only:
+        // +90 555 012 3456 -> 905550123456 veya local format
+        digits = ExtractDigits(phone_raw)
+        IF startsWithCountryCodeMissing(digits) THEN
+            digits = AddDefaultCountryCode(digits)
+        RETURN digits
+
+    FONKSİYON SplitName(raw_name) RETURN {first, last, others}:
+        parts = SplitBySpaces(raw_name)
+        IF LENGTH(parts) == 0 THEN RETURN { "", "", [] }
+        // Basit heuristik: son kelime soyadı
+        last = parts[-1]
+        first = parts[0]
+        others = parts[1:-1]
+        RETURN {first, last, others}
+
+    FONKSİYON CompareNames(a, b, prefs) RETURN -1|0|1:
+        // Karşılaştırma kuralı: prefs.sort_key belirler
+        // ÖNEMLİ: locale-aware collation önerilir; burada basit normalized string karşılaştırması
+        ka = BuildCompareKey(a, prefs.sort_key, prefs.locale)
+        kb = BuildCompareKey(b, prefs.sort_key, prefs.locale)
+        IF ka < kb THEN RETURN -1
+        ELSE IF ka > kb THEN RETURN 1
+        ELSE
+           // Ties: stabilize by ID to keep deterministic
+           IF a.id < b.id THEN RETURN -1 ELSE IF a.id > b.id THEN RETURN 1 ELSE RETURN 0
+        SON
+
+    FONKSİYON BuildCompareKey(contact, sort_key, locale) RETURN string:
+        IF sort_key == "last_first" THEN
+            key = NormalizeString(contact.last_name, locale) + "|" + NormalizeString(contact.first_name, locale)
+        ELSE IF sort_key == "first_last" THEN
+            key = NormalizeString(contact.first_name, locale) + "|" + NormalizeString(contact.last_name, locale)
+        ELSE
+            key = "" 
+            FOR field IN sort_key_list:
+                key += NormalizeString(contact[field], locale) + "|"
+        RETURN key
+
+    // Sorting algorithm selection
+    FONKSİYON ChooseSortAlgorithm(n, prefs) RETURN algorithm_name:
+        IF n <= prefs.small_threshold THEN RETURN "insertion"
+        IF prefs.prefer_stable_sort == TRUE THEN RETURN "merge_or_timsort"
+        IF memory_is_limited THEN RETURN "inplace_quicksort"
+        RETURN "merge_or_timsort"
+
+    // Stable merge sort (basit high level)
+    FONKSİYON MergeSort(list, CompareFunc) RETURN sorted_list:
+        IF LENGTH(list) <= 1 THEN RETURN list
+        mid = LENGTH(list) // 2
+        left = MergeSort(list[0:mid], CompareFunc)
+        right = MergeSort(list[mid:], CompareFunc)
+        RETURN Merge(left, right, CompareFunc)
+
+    FONKSİYON Merge(left, right, CompareFunc) RETURN merged:
+        merged = []
+        i = 0; j = 0
+        WHILE i < LENGTH(left) AND j < LENGTH(right):
+            IF CompareFunc(left[i], right[j]) <= 0 THEN
+               merged.append(left[i]); i += 1
+            ELSE
+               merged.append(right[j]); j += 1
+        // append remaining
+        appended_remaining(merged, left, i)
+        appended_remaining(merged, right, j)
+        RETURN merged
+
+    // Binary search helpers (for prefix range)
+    FONKSİYON LowerBound(sorted_list, target_prefix, CompareKeyFunc) RETURN index:
+        lo = 0; hi = LENGTH(sorted_list)
+        WHILE lo < hi:
+            mid = (lo + hi) // 2
+            key = CompareKeyFunc(sorted_list[mid])
+            IF key < target_prefix THEN
+                lo = mid + 1
+            ELSE
+                hi = mid
+        RETURN lo
+
+    FONKSİYON UpperBound(sorted_list, target_prefix_upper, CompareKeyFunc) RETURN index:
+        // similar; finds first element greater than prefix ceiling
+        lo = 0; hi = LENGTH(sorted_list)
+        WHILE lo < hi:
+            mid = (lo + hi) // 2
+            key = CompareKeyFunc(sorted_list[mid])
+            IF key <= target_prefix_upper THEN
+                lo = mid + 1
+            ELSE
+                hi = mid
+        RETURN lo
+
+    // Trie build & prefix search (opsiyonel)
+    FONKSİYON BuildTrie(contacts) RETURN trie_root:
+        root = NewTrieNode()
+        FOR c IN contacts:
+            name_key = NormalizeString(c.normalized_name, prefs.locale)
+            node = root
+            FOR ch IN Characters(name_key):
+                IF node.children[ch] == NULL THEN node.children[ch] = NewTrieNode()
+                node = node.children[ch]
+            node.contacts_list.append(c.id)
+        RETURN root
+
+    FONKSİYON TriePrefixSearch(root, prefix) RETURN list_of_contact_ids:
+        node = root
+        FOR ch IN Characters(prefix):
+            node = node.children.get(ch)
+            IF node == NULL THEN RETURN []
+        RETURN CollectContactsUnderNode(node) // DFS/BFS collect
+
+    // Fuzzy search (levenshtein up to threshold) - high level
+    FONKSİYON FuzzySearch(query, contacts_index, max_dist) RETURN matches:
+        matches = []
+        FOR c IN candidate_subset(contacts_index, heuristics):
+            d = LevenshteinDistance(NormalizeString(query), c.normalized_name)
+            IF d <= max_dist THEN matches.append({contact: c, dist: d})
+        SORT matches by dist asc, then alphabetical
+        RETURN matches
+
+    // Dedup
+    FONKSİYON MergeDuplicates(contacts) RETURN merged_contacts:
+        // key by normalized phone or normalized name + phone similarity
+        map_by_phone = {}
+        FOR c IN contacts:
+            FOR p IN c.normalized_phone_numbers:
+                IF map_by_phone[p] exists THEN
+                    map_by_phone[p] = MergeTwoContacts(map_by_phone[p], c)
+                ELSE
+                    map_by_phone[p] = c
+        // remaining contacts without phone handle by name similarity clustering
+        RETURN map_by_phone.values()
+
+    // ---------- Ana Akış ----------
+    BAŞLA
+
+    // 1) Parse & normalize input
+    contacts = []
+    FOR raw IN contacts_raw_list:
+        contact = {}
+        contact.id = GenerateUniqueID()
+        contact.raw_name = raw.name
+        nameparts = SplitName(raw.name)
+        contact.first_name = nameparts.first
+        contact.last_name = nameparts.last
+        contact.company = raw.company OR ""
+        contact.phone_numbers = raw.phone_numbers OR []
+        contact.normalized_name = NormalizeString(raw.name, prefs.locale)
+        contact.normalized_phone_numbers = []
+        FOR ph IN contact.phone_numbers:
+            contact.normalized_phone_numbers.append(NormalizePhoneNumber(ph))
+        contacts.append(contact)
+
+    // 2) Deduplicate (öncelik: phone number eşleşmeleri)
+    contacts = MergeDuplicates(contacts)
+
+    // 3) Build compare keys (cache)
+    FOR c IN contacts:
+        c.compare_key = BuildCompareKey(c, prefs.sort_key, prefs.locale)
+
+    // 4) Choose sorting algorithm
+    n = LENGTH(contacts)
+    algo = ChooseSortAlgorithm(n, prefs)
+
+    // 5) Sort
+    IF algo == "insertion":
+        contacts_sorted = InsertionSort(contacts, CompareNames) // insertion sort uses CompareNames
+    ELSE IF algo == "merge_or_timsort":
+        contacts_sorted = MergeSort(contacts, CompareNames)
+    ELSE IF algo == "inplace_quicksort":
+        QuickSortInPlace(contacts, 0, n-1, CompareNames)
+
+    // 6) Build indices for search
+    indices.hash_map_by_phone = {}
+    FOR c IN contacts_sorted:
+        FOR p IN c.normalized_phone_numbers:
+            indices.hash_map_by_phone[p] = c.id  // last-wins or keep list
+
+    IF prefs.prefix_search_enabled:
+        // Option A: build trie
+        indices.trie_by_name = BuildTrie(contacts_sorted)
+        // Option B (alternative): keep sorted_array_index = contacts_sorted (already)
+        indices.sorted_array_index = contacts_sorted
+
+    // 7) Expose search APIs (wrapper)
+    // Exact lookup by phone → O(1) expected
+    // Exact lookup by full name → binary search on sorted keys or hash map if built
+    // Prefix lookup → trie OR binary range (lowerBound..upperBound)
+    // Fuzzy → BK-tree or Levenshtein-based scan with heuristics
+
+    // 8) Handle updates (ekle/sil/güncelle)
+    // Eğer frequent_updates:
+    //   - prefer balanced tree or keep "dirty" flag and incremental re-sort after X ops
+    //   - or insert into sorted array using binary search + insert (O(n) worst-case)
+    // Pseudocode: InsertContact
+    FONKSİYON InsertContact(new_raw):
+        new = ParseAndNormalize(new_raw) // same steps as above
+        IF frequent_updates == TRUE:
+            // Option: insert into balanced tree / B-tree -> O(log n)
+            BalancedTreeInsert(tree_root, new)
+            MarkIndicesDirty()
+        ELSE:
+            // Insert into sorted array with binary search to find position
+            pos = LowerBound(contacts_sorted, new.compare_key, lambda x: x.compare_key)
+            contacts_sorted.insert(pos, new) // O(n) shift
+            UpdateIndicesAfterInsert(new, pos)
+
+    // 9) Periodic maintenance
+    // EVERY day/week/month depending on size: rebuild indices if dirty, re-balance trees, run duplicate merging.
+
+    BİTİR
